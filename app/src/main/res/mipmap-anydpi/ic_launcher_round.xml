@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This folder is now empty to avoid errors on API < 26. Adaptive icons are in mipmap-anydpi-v26 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+</selector>
