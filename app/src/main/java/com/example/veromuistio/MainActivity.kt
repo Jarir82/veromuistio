@@ -507,7 +507,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun OnboardingScreen(vm: VeromuistioViewModel) {
     val pagerState = rememberPagerState(pageCount = { 3 })
-    val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize().background(SoftWood)) {
         HorizontalPager(
@@ -687,7 +686,7 @@ fun VeromuistioApp(vm: VeromuistioViewModel, onCam: ((Uri) -> Unit) -> Unit, onG
         }
     }, floatingActionButton = { LargeFloatingActionButton({ editingTransaction = null; showEdit = true }, containerColor = AccentAmber, contentColor = DeepBark, shape = CircleShape) { Icon(Icons.Default.Add, null, Modifier.size(36.dp)) } }) { p ->
         Box(Modifier.padding(p).fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-            if (tab == 0 || !vm.isVatRegistered) Column { SummaryView(txs, vm.isVatRegistered, vm.isDarkTheme, vm); TransactionList(txs) { editingTransaction = it; showEdit = true } }
+            if (tab == 0 || !vm.isVatRegistered) Column { SummaryView(txs, vm.isVatRegistered, vm.isDarkTheme); TransactionList(txs) { editingTransaction = it; showEdit = true } }
             else VatSummaryView(txs)
         }
         if (showEdit) TransactionDialog(editingTransaction, { showEdit = false }, { vm.save(it); showEdit = false }, { vm.delete(it); showEdit = false }, onCam, onGal, vm.isVatRegistered, vm)
@@ -695,7 +694,7 @@ fun VeromuistioApp(vm: VeromuistioViewModel, onCam: ((Uri) -> Unit) -> Unit, onG
 }
 
 @Composable
-fun SummaryView(txs: List<Transaction>, isVatRegistered: Boolean, isDarkTheme: Boolean, vm: VeromuistioViewModel) {
+fun SummaryView(txs: List<Transaction>, isVatRegistered: Boolean, isDarkTheme: Boolean) {
     val inc = txs.filter { it.type == TransactionType.INCOME }.sumOf { it.totalAmount }
     val workVal = txs.filter { it.type == TransactionType.INCOME && it.isDeliverySale }.sumOf { it.workValue }
     val deprCats = listOf("Koneet ja kalusto", "Rakennukset", "Ojat ja tiet")
@@ -997,8 +996,6 @@ fun TransactionDialog(t: Transaction? = null, onDismiss: () -> Unit, onSave: (Tr
                     TextField(purp, { purp = it }, Modifier.fillMaxWidth(), label = { Text("Ajon tarkoitus") }, keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
                     TextField(dest, { dest = it }, Modifier.fillMaxWidth(), label = { Text("Kohde") }, keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val mVal = mil.replace(',', '.')
-                        val rVal = rate.replace(',', '.')
                         TextField(mil, { mil = it }, Modifier.weight(1f), label = { Text("Kilometrit") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
                         TextField(rate, { rate = it }, Modifier.weight(1f), label = { Text("€/km") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
                     }
