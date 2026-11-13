@@ -52,8 +52,8 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.zip.*
 
-class VeromuistioViewModel(private val dao: TransactionDao, context: Context) : ViewModel() {
-    private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+class VeromuistioViewModel(private val dao: TransactionDao, private val appContext: Context) : ViewModel() {
+    private val prefs = appContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
     val txs: StateFlow<List<Transaction>> = dao.getAllTransactions().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     
     var isVatRegistered by mutableStateOf(prefs.getBoolean("is_vat_registered", true))
@@ -82,22 +82,66 @@ class VeromuistioViewModel(private val dao: TransactionDao, context: Context) : 
 
     fun save(t: Transaction) = viewModelScope.launch { if (t.id == 0) dao.insertTransaction(t) else dao.updateTransaction(t) }
     fun saveAll(list: List<Transaction>) = viewModelScope.launch { dao.insertTransactions(list) }
-    fun delete(t: Transaction) = viewModelScope.launch { dao.deleteTransaction(t) }
+    fun delete(t: Transaction) = viewModelScope.launch {
+        dao.deleteTransaction(t)
+        // Poistetaan tositteen kuvat, jos mikään muu tosite ei käytä samaa kuvaa
+        val stillUsed = txs.value.filter { it.id != t.id }.flatMap { it.receiptPaths }.toSet()
+        withContext(Dispatchers.IO) {
+            t.receiptPaths.filter { it !in stillUsed }.forEach { deleteOwnImage(it) }
+        }
+    }
+
+    // Poistaa vain sovelluksen omaan kuvakansioon tallennetut kuvat
+    private fun deleteOwnImage(path: String) {
+        try {
+            val uri = Uri.parse(path)
+            val picturesDir = appContext.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return
+            val file = when {
+                uri.scheme == "file" -> File(uri.path ?: return)
+                uri.scheme == "content" && uri.authority == "${appContext.packageName}.fileprovider" -> File(picturesDir, uri.lastPathSegment ?: return)
+                else -> return
+            }
+            if (file.canonicalPath.startsWith(picturesDir.canonicalPath)) file.delete()
+        } catch (e: Exception) {}
+    }
 
     fun getYearlyCubicMeters(year: String, list: List<Transaction>): Double {
-        return list.filter { it.isDeliverySale && it.date.endsWith(".$year") }.sumOf { it.cubicMeters ?: 0.0 }
+        return list.filter { it.type == TransactionType.INCOME && it.isDeliverySale && it.date.endsWith(".$year") }.sumOf { it.cubicMeters ?: 0.0 }
     }
 }
 
 class MainActivity : ComponentActivity() {
     private var tempUri: Uri? = null
+    private var tempFile: File? = null
     private var onImg: ((Uri) -> Unit)? = null
     private lateinit var vm: VeromuistioViewModel
     private var txsToPdf: List<Transaction> = emptyList()
     private var pdfYear: String = ""
 
-    private val takePic = registerForActivityResult(ActivityResultContracts.TakePicture()) { if (it) tempUri?.let { u -> onImg?.invoke(u) } }
-    private val pickMed = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { it?.let { u -> onImg?.invoke(u) } }
+    private val takePic = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok) tempUri?.let { u -> onImg?.invoke(u) }
+        else tempFile?.delete() // Peruttu kuvaus: poistetaan tyhjä tiedosto
+    }
+
+    // Galleriakuvan lupa on väliaikainen, joten kuva kopioidaan sovelluksen omaan kansioon
+    private val pickMed = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { picked ->
+        picked?.let { u ->
+            lifecycleScope.launch {
+                val local = withContext(Dispatchers.IO) { copyToAppStorage(u) }
+                if (local != null) onImg?.invoke(local)
+                else Toast.makeText(this@MainActivity, "Kuvan tallennus epäonnistui", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun copyToAppStorage(src: Uri): Uri? = try {
+        val f = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "IMG_${System.currentTimeMillis()}.jpg")
+        val copied = contentResolver.openInputStream(src)?.use { ins -> f.outputStream().use { ins.copyTo(it) }; true } ?: false
+        if (copied) FileProvider.getUriForFile(this, "${packageName}.fileprovider", f) else null
+    } catch (e: Exception) { null }
+
+    // Poistaa CSV:tä rikkovat merkit (erotin ja rivinvaihdot)
+    private fun csvClean(s: String?): String = s?.replace(";", " ")?.replace("\r", " ")?.replace("\n", " ") ?: ""
     private val reqPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) startCam() else Toast.makeText(this, "Lupa tarvitaan", Toast.LENGTH_SHORT).show() }
     
     private val createZip = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
@@ -106,7 +150,7 @@ class MainActivity : ComponentActivity() {
                 contentResolver.openOutputStream(u)?.use { os ->
                     ZipOutputStream(os).use { zos ->
                         val csv = vm.txs.value.joinToString("\n") { 
-                            "${it.id};${it.date};${it.description.replace(";"," ")};${it.amount};${it.type};${it.category};${it.vatRate};${it.mileage ?: ""};${it.ratePerKm ?: ""};${it.purpose?.replace(";"," ") ?: ""};${it.receiptPaths.joinToString("|")};${it.destination?.replace(";"," ") ?: ""};${it.withholdingTax ?: ""};${it.isDeliverySale};${it.cubicMeters ?: ""};${it.workValuePerUnit ?: ""}"
+                            "${it.id};${it.date};${csvClean(it.description)};${it.amount};${it.type};${csvClean(it.category)};${it.vatRate};${it.mileage ?: ""};${it.ratePerKm ?: ""};${csvClean(it.purpose)};${it.receiptPaths.joinToString("|")};${csvClean(it.destination)};${it.withholdingTax ?: ""};${it.isDeliverySale};${it.cubicMeters ?: ""};${it.workValuePerUnit ?: ""};${it.workHours ?: ""}"
                         }
                         zos.putNextEntry(ZipEntry("veromuistio_data.csv"))
                         zos.write(csv.toByteArray())
@@ -172,6 +216,7 @@ class MainActivity : ComponentActivity() {
                                         val isDelVal = if (p.size > 13) p[13].toBoolean() else false
                                         val m3Val = if (p.size > 14) p[14].toDoubleOrNull() else null
                                         val unitVal = if (p.size > 15) p[15].toDoubleOrNull() else null
+                                        val hoursVal = if (p.size > 16) p[16].toDoubleOrNull() else null
 
                                         val isDuplicate = existingTxs.any { 
                                             it.date == dateVal && it.description == descVal && it.amount == amountVal &&
@@ -184,7 +229,8 @@ class MainActivity : ComponentActivity() {
                                                 type = typeVal, category = catVal, vatRate = vatVal,
                                                 mileage = milVal, ratePerKm = rateVal, purpose = purpVal,
                                                 receiptPaths = newPaths, destination = destVal, withholdingTax = withVal,
-                                                isDeliverySale = isDelVal, cubicMeters = m3Val, workValuePerUnit = unitVal
+                                                isDeliverySale = isDelVal, cubicMeters = m3Val, workValuePerUnit = unitVal,
+                                                workHours = hoursVal
                                             ))
                                         }
                                     }
@@ -252,7 +298,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkPerm() { if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCam() else reqPerm.launch(Manifest.permission.CAMERA) }
-    private fun startCam() { val f = File.createTempFile("IMG_${System.currentTimeMillis()}", ".jpg", getExternalFilesDir(Environment.DIRECTORY_PICTURES)); tempUri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", f); tempUri?.let { takePic.launch(it) } }
+    private fun startCam() { val f = File.createTempFile("IMG_${System.currentTimeMillis()}", ".jpg", getExternalFilesDir(Environment.DIRECTORY_PICTURES)); tempFile = f; tempUri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", f); tempUri?.let { takePic.launch(it) } }
+
+    // Lukee kuvan pienennettynä, ettei iso kamerakuva vie muistia loppuun
+    private fun decodeScaledBitmap(uri: Uri, maxSize: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= maxSize && bounds.outHeight / (sample * 2) >= maxSize) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        return contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+    }
 
     private fun generatePdf(txs: List<Transaction>, year: String, out: OutputStream, isVatRegistered: Boolean) {
         val doc = PdfDocument()
@@ -420,16 +477,19 @@ class MainActivity : ComponentActivity() {
                         }
                         y += 10f
                         try {
-                            val uri = Uri.parse(path)
-                            contentResolver.openInputStream(uri)?.use { ins ->
-                                val original = BitmapFactory.decodeStream(ins)
-                                if (original != null) {
-                                    val scale = Math.min(500f / original.width, 500f / original.height)
-                                    val scaled = Bitmap.createScaledBitmap(original, (original.width * scale).toInt(), (original.height * scale).toInt(), true)
-                                    canvas.drawBitmap(scaled, 50f, y, paint)
-                                }
+                            val original = decodeScaledBitmap(Uri.parse(path), 1000)
+                            if (original != null) {
+                                val scale = Math.min(500f / original.width, 500f / original.height)
+                                val scaled = Bitmap.createScaledBitmap(original, (original.width * scale).toInt(), (original.height * scale).toInt(), true)
+                                canvas.drawBitmap(scaled, 50f, y, paint)
+                                if (scaled !== original) scaled.recycle()
+                                original.recycle()
+                            } else {
+                                canvas.drawText("Kuvaa ei löytynyt.", 50f, y + 20f, grayPaint)
                             }
-                        } catch (e: Exception) {}
+                        } catch (e: Throwable) {
+                            canvas.drawText("Kuvan lataus epäonnistui.", 50f, y + 20f, grayPaint)
+                        }
                         doc.finishPage(page)
                     }
                 }
@@ -637,7 +697,7 @@ fun VeromuistioApp(vm: VeromuistioViewModel, onCam: ((Uri) -> Unit) -> Unit, onG
 @Composable
 fun SummaryView(txs: List<Transaction>, isVatRegistered: Boolean, isDarkTheme: Boolean, vm: VeromuistioViewModel) {
     val inc = txs.filter { it.type == TransactionType.INCOME }.sumOf { it.totalAmount }
-    val workVal = txs.filter { it.isDeliverySale }.sumOf { it.workValue }
+    val workVal = txs.filter { it.type == TransactionType.INCOME && it.isDeliverySale }.sumOf { it.workValue }
     val deprCats = listOf("Koneet ja kalusto", "Rakennukset", "Ojat ja tiet")
     val depr = if (isVatRegistered) txs.filter { it.category in deprCats }.sumOf { it.totalAmount - it.vatAmount } else txs.filter { it.category in deprCats }.sumOf { it.totalAmount }
     val exp = if (isVatRegistered) txs.filter { it.type == TransactionType.EXPENSE && it.category !in deprCats }.sumOf { it.totalAmount - it.vatAmount } else txs.filter { it.type == TransactionType.EXPENSE && it.category !in deprCats }.sumOf { it.totalAmount }
@@ -842,18 +902,26 @@ fun TransactionDialog(t: Transaction? = null, onDismiss: () -> Unit, onSave: (Tr
                         vatRate = if (isVatRegistered) vat else 0.0, 
                         receiptPaths = paths, 
                         withholdingTax = if(cat == "Pystykauppa" || cat == "Hankintakauppa") withTax.replace(',','.').toDoubleOrNull() else null,
-                        isDeliverySale = isDeliverySale,
-                        cubicMeters = if(isDeliverySale) m3.replace(',','.').toDoubleOrNull() else null,
-                        workValuePerUnit = if(isDeliverySale) unitValue.replace(',','.').toDoubleOrNull() else null
+                        isDeliverySale = isDeliverySale && type == TransactionType.INCOME,
+                        cubicMeters = if(isDeliverySale && type == TransactionType.INCOME) m3.replace(',','.').toDoubleOrNull() else null,
+                        workValuePerUnit = if(isDeliverySale && type == TransactionType.INCOME) unitValue.replace(',','.').toDoubleOrNull() else null
                     )
                     onSave(n)
                 }) { Text("TALLENNA", fontWeight = FontWeight.Bold) }
             })
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                // Tyypin vaihto nollaa kategorian ja hankintakauppa-valinnan, ettei edellisen tyypin valinnat jää voimaan
+                val changeType: (TransactionType) -> Unit = { nt ->
+                    if (nt != type) {
+                        type = nt
+                        cat = if (nt == TransactionType.EXPENSE) "Muut kulut" else "Pystykauppa"
+                        isDeliverySale = false
+                    }
+                }
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                    SegmentedButton(type == TransactionType.INCOME, { type = TransactionType.INCOME }, SegmentedButtonDefaults.itemShape(0, 3)) { Text("Tulo") }
-                    SegmentedButton(type == TransactionType.EXPENSE, { type = TransactionType.EXPENSE }, SegmentedButtonDefaults.itemShape(1, 3)) { Text("Meno") }
-                    SegmentedButton(type == TransactionType.MILEAGE, { type = TransactionType.MILEAGE }, SegmentedButtonDefaults.itemShape(2, 3)) { Text("Ajo") }
+                    SegmentedButton(type == TransactionType.INCOME, { changeType(TransactionType.INCOME) }, SegmentedButtonDefaults.itemShape(0, 3)) { Text("Tulo") }
+                    SegmentedButton(type == TransactionType.EXPENSE, { changeType(TransactionType.EXPENSE) }, SegmentedButtonDefaults.itemShape(1, 3)) { Text("Meno") }
+                    SegmentedButton(type == TransactionType.MILEAGE, { changeType(TransactionType.MILEAGE) }, SegmentedButtonDefaults.itemShape(2, 3)) { Text("Ajo") }
                 }
                 
                 if (type == TransactionType.INCOME || type == TransactionType.EXPENSE) {
@@ -897,7 +965,7 @@ fun TransactionDialog(t: Transaction? = null, onDismiss: () -> Unit, onSave: (Tr
                                 Text("Hankintatyön arvo: ${String.format("%.2f", workVal)} €", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
                                 
                                 val yearStr = date.split(".").last()
-                                val otherTxsM3 = allTxs.filter { it.id != (t?.id ?: 0) && it.isDeliverySale && it.date.endsWith(".$yearStr") }.sumOf { it.cubicMeters ?: 0.0 }
+                                val otherTxsM3 = allTxs.filter { it.id != (t?.id ?: 0) && it.type == TransactionType.INCOME && it.isDeliverySale && it.date.endsWith(".$yearStr") }.sumOf { it.cubicMeters ?: 0.0 }
                                 val yearlyM3 = otherTxsM3 + m3Val
                                     
                                 if (yearlyM3 > 125.0) {
